@@ -1,0 +1,100 @@
+# @package model
+# UMA: the released network.
+#   - Scene tokens: PointNet++ over the camera-frame pointcloud, fused with the visual patch features sampled at the
+#     PointNet++ query points.
+#   - Everything is expressed in the frame of the observing camera: task specification, pointcloud, tracked flows
+#     and actions (executable actions are returned in the robot base frame).
+#   - Scene, wrist and specification tokens do not attend to the noisy action and flow tokens (isolate_context).
+#   - EMA weights; action positions normalized by their measured per-position spread (action_position_std).
+
+# Feature extractor configuration
+feature_extractor:
+  _target_: uma.policy.masked_policy.UMATransformer
+  obs_horizon: ${model.actor_config.obs_horizon}
+  pred_horizon: ${model.actor_config.pred_horizon}
+  far_future_times: ${model.actor.additional_times}
+  token_dim: 384
+  n_spec_tokens: 16
+  num_layers: 6
+  num_layers_stt: 3
+  num_layers_agg: 2
+  num_layers_language: 2
+  absolute_time_encoding_dim: 64
+  pred_t_encoding_dim: 64
+  # Small time embedding so spec geometry (xyz + displacement) isn't a tiny
+  # fraction of the spec-token input dims.
+  flow_spec_time_embedding_dim: 16
+  is_flow_matching: ${model.actor.is_flow_matching}
+  encoder_type: "siglip2"
+  # Scene, wrist and specification tokens attend only to each other, not to the noisy action / flow tokens.
+  isolate_context: true
+  # Auxiliary readout of the specification's net motion: token-wise normalization,
+  # mean pooling, and a small MLP whose prediction is bounded to 2 m.
+  motion_readout_hidden_dim: 128
+  motion_readout_max_displacement_m: 2.0
+  contrastive_projection_dim: 512
+  # The motion readout is a probe: trained on detached spec tokens, so its loss
+  # does not shape the spec encoder (the action / flow losses do).
+  motion_readout_detach: true
+
+# Actor configuration
+actor_config:
+  _target_: uma.policy.base.PolicyActorConfig
+  pred_horizon: 16
+  obs_horizon: 8
+  act_horizon: 8
+  learning_rate: 1e-4
+  weight_decay: 1e-6
+  use_ema: true
+  max_grad_norm: 1.0
+
+# Actor configuration
+actor:
+  _target_: uma.policy.masked_policy.UMAActor
+  feature_extractor: ${model.feature_extractor}
+  actor_config: ${model.actor_config}
+  # Far-future targets force the model to commit to task-level motion that is
+  # not predictable from the 8-step history alone, so the task specification
+  # actually carries gradient signal.
+  additional_times: [32, 64, 128]
+  max_language_len: 64
+  pointcloud_n_points: 2048
+  max_gripper_velocity: 0.05 # In meters per timestep
+  max_flow_velocity: 0.05 # In meters per timestep
+  action_clip_position: 0.02 # Max position (in meters) for action prediction, used for clipping the target actions during training
+  flow_clip_position: 0.02 # Max position (in meters) for flow prediction, used for clipping the target flows during training
+  # Per-axis RMS displacement from the current end effector, per token position (8 history incl. current, 16 future,
+  # far future 32/64/128), measured over the simulated DROID training data; floor 2 mm. Re-measure before training
+  # on data with a different motion scale (e.g. real DROID).
+  action_position_std: [0.0172, 0.015, 0.0127, 0.0104, 0.008, 0.0055, 0.0029, 0.002, 0.0115, 0.0129, 0.0146, 0.0163, 0.0182, 0.0201, 0.0221, 0.024, 0.026, 0.028, 0.0299, 0.0319, 0.0338, 0.0357, 0.0376, 0.0395, 0.0647, 0.1117, 0.1629]
+  num_training_steps: 10000000
+  timesteps_test: 10
+  max_train_timestep: 1.0 # flow-matching training t in (0.001, max]; t = 1 is clean data (0.9 excludes the near-clean range)
+  # Hide the proprioceptive inputs: on clean demonstrations these alone can predict the labels.
+  # Evaluation must use the training run's values.
+  hide_proprio_history: false
+  hide_current_pose: false
+  loss_weights:
+    action_position_loss: 2.0
+    action_rotation_loss: 1.0
+    action_gripper_loss: 0.1
+    far_action_position_loss: 0.2
+    far_action_rotation_loss: 0.1
+    far_action_gripper_loss: 0.01
+    flow_position_loss: 1.0
+    flow_visibility_loss: 0.0001
+    far_flow_position_loss: 0.1
+    contrastive_loss: 0.001
+    motion_readout_loss: 0.1  # trains only the (detached) readout probe, see motion_readout_detach
+  is_flow_matching: true
+  detach_tracking: true
+  apply_se3_augmentation: true
+  se3_translation_std: 0.1
+  # Mirroring and large rotations flip task semantics (push-left vs push-right),
+  # which teaches the spec encoder to discard motion direction when the
+  # transformed specs serve as contrastive positives.
+  se3_mirror_prob: 0.0
+  se3_rotation_max_angle: 0.5236 # ~30 deg yaw about gravity
+  contrastive_hard_negative_specs: true
+  encoder_type: ${model.feature_extractor.encoder_type}
+  prompt_tuning: false
